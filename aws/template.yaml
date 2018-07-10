@@ -16,6 +16,11 @@ Parameters:
     Description: Name of Lambda function that will update tasks.
     Type: String
     Default: ECRNewTaskDeploy
+    
+  ClusterSuffix:
+    Description: Suffix used to name ECS cluster.
+    Type: String
+    Default: ECSCluster
 
 Conditions:
 
@@ -105,7 +110,7 @@ Resources:
       FunctionName: !Ref LambdaFunctionName
       Environment:
         Variables:
-          CLUSTER_SUFFIX: ECSCluster
+          CLUSTER_SUFFIX: !Ref ClusterSuffix
       Handler: "deploy_handler.lambda_handler"
       Role: !GetAtt ECRDeployLambdaRole.Arn
       Code:
