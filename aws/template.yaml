@@ -1,0 +1,197 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+
+  CloudTrailBucket:
+    Description: Name of the S3 bucket where CloudTrail logs will be stored.
+    Type: String
+    Default: cloud-trail-log
+    
+  EcrTaskDeploymentBucket:
+    Description: Name of the S3 bucket where ecr-task-deployment template and lambda function will be stored.
+    Type: String
+    Default: ecr-task-deployment
+
+  LambdaFunctionName:
+    Description: Name of Lambda function that will update tasks.
+    Type: String
+    Default: ECRNewTaskDeploy
+
+Conditions:
+
+  GovCloudCondition:
+    Fn::Equals:
+      - Ref: AWS::Region
+      - us-gov-west-1
+
+Resources:
+
+  ECRPushRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Event triggered when a Docker image is pushed to ECR.
+      EventPattern:
+        source:
+          - aws.ecr
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - ecr.amazonaws.com
+          eventName:
+            - PutImage
+      Name: ECRPutImage
+      Targets:
+        - Arn: !GetAtt ECRDeploy.Arn
+          Id: !Ref ECRDeploy
+
+  ECRDeployLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - "arn:aws:iam::aws:policy/AmazonEC2ContainerServiceFullAccess"
+        - "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+      Policies:
+        - PolicyName: ECRDeployLambdaS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - s3:ListBucket
+                Resource:
+                  Fn::Sub:
+                    - arn:${Partition}:s3:::${EcrTaskDeploymentBucket}
+                    - Partition:
+                        Fn::If:
+                          - GovCloudCondition
+                          - aws-us-gov
+                          - aws
+                Effect: Allow
+              - Action:
+                  - s3:GetObject
+                Resource:
+                  Fn::Sub:
+                    - arn:${Partition}:s3:::${EcrTaskDeploymentBucket}/*
+                    - Partition:
+                        Fn::If:
+                          - GovCloudCondition
+                          - aws-us-gov
+                          - aws
+                Effect: Allow
+      Path: "/"
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    DependsOn: ECRDeploy
+    Properties:
+      FunctionName: !Ref ECRDeploy
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ECRPushRule.Arn
+
+  ECRDeploy:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Environment:
+        Variables:
+          CLUSTER_SUFFIX: ECSCluster
+      Handler: "deploy_handler.lambda_handler"
+      Role: !GetAtt ECRDeployLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref EcrTaskDeploymentBucket
+        S3Key: "deploy_handler.zip"
+      Runtime: "python3.6"
+      Timeout: 25
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+
+  CloudTrailToCloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "cloudtrail.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: SendToCloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AWSCloudTrailCreateLogStream2014110
+                Effect: Allow
+                Action: logs:CreateLogStream
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:CloudTrail/DefaultLogGroup:log-stream:*
+              - Sid: AWSCloudTrailPutLogEvents20141101
+                Effect: Allow
+                Action: logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:CloudTrail/DefaultLogGroup:log-stream:*
+
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn:
+      - CloudTrailLogGroup
+      - CloudTrailBucket
+    Properties:
+      S3BucketName: !Ref CloudTrailBucket
+      IsLogging: true
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailToCloudWatchLogsRole.Arn
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      TrailName: GeneralTrail
+
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: CloudTrail/DefaultLogGroup
+      RetentionInDays: 14
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: CloudTrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AWSCloudTrailAclCheck"
+            Effect: "Allow"
+            Principal:
+              Service: "cloudtrail.amazonaws.com"
+            Action: "s3:GetBucketAcl"
+            Resource:
+              !Sub |-
+                arn:aws:s3:::${CloudTrailBucket}
+          - Sid: "AWSCloudTrailWrite"
+            Effect: "Allow"
+            Principal:
+              Service: "cloudtrail.amazonaws.com"
+            Action: "s3:PutObject"
+            Resource:
+              !Sub |-
+                arn:aws:s3:::${CloudTrailBucket}/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: "bucket-owner-full-control"
+
+  CloudTrailBucket:
+    DeletionPolicy: Delete
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref CloudTrailBucket
